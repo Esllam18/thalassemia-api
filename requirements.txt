@@ -1,0 +1,32 @@
+# ============================================================
+# Thalassemia Prediction API — Python Dependencies
+# All versions pinned for reproducible deployments.
+# Install: pip install -r requirements.txt
+# ============================================================
+
+# Web framework
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+gunicorn==23.0.0
+python-multipart==0.0.12
+
+# Data validation
+pydantic==2.10.3
+
+# ML / Data
+scikit-learn==1.6.1
+joblib==1.4.2
+pandas==2.2.3
+numpy==1.26.4
+openpyxl==3.1.5
+
+# Image / OCR
+Pillow==11.0.0
+opencv-python-headless==4.10.0.84
+pytesseract==0.3.13
+
+# Rate limiting
+slowapi==0.1.9
+
+# Environment
+python-dotenv==1.0.1

@@ -1,0 +1,45 @@
+# Environment — NEVER commit these
+.env
+.env.local
+.env.production
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# ML model artefacts (large binary files — use Git LFS or store separately)
+# Comment these lines out if you WANT to commit the model files.
+# *.pkl
+# *.joblib
+# *.h5
+# *.pt
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Docker
+.dockerignore
