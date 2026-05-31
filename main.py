@@ -1,13 +1,10 @@
-"""
-Thalassemia Prediction API v3.0 - Clean Rewrite
-No unicode. No complex decorators. Verified working with FastAPI 0.115.5 + Pydantic v2.
-"""
 
 import io
 import logging
 import os
 import re
 import sys
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
@@ -19,6 +16,7 @@ import pytesseract
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -35,10 +33,13 @@ logging.basicConfig(
 logger = logging.getLogger("thalassemia_api")
 
 # ---- Config -----------------------------------------------------------------
-MODEL_PATH   = os.getenv("MODEL_PATH",   "thalassemia_expert_model.pkl")
-ENCODER_PATH = os.getenv("ENCODER_PATH", "label_encoder.pkl")
-MAX_BYTES    = int(os.getenv("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
+MODEL_PATH    = os.getenv("MODEL_PATH",   "thalassemia_expert_model.pkl")
+ENCODER_PATH  = os.getenv("ENCODER_PATH", "label_encoder.pkl")
+MAX_BYTES     = int(os.getenv("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
 MCV_THRESHOLD = float(os.getenv("MCV_NORMAL_THRESHOLD", "81.0"))
+
+# Max image dimensions to prevent memory attacks (e.g. 20000x20000 PNG)
+MAX_IMAGE_DIM = 8000
 
 raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:8088")
 ALLOWED_ORIGINS: List[str] = [o.strip() for o in raw_origins.split(",") if o.strip()]
@@ -84,7 +85,7 @@ async def lifespan(app: FastAPI):
     if _model and _label_encoder:
         logger.info("API ready - all systems nominal")
     else:
-        logger.warning("API started but model missing - predict endpoints return 503")
+        logger.warning("API started but model/encoder missing - predict endpoints will return 503")
     yield
     logger.info("Shutdown complete.")
 
@@ -93,7 +94,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Thalassemia Diagnosis API",
     description="Predicts thalassemia type from CBC indices.",
-    version="3.0.0",
+    version="3.1.0",
     lifespan=lifespan,
 )
 
@@ -107,6 +108,40 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+
+# ---- Middleware: attach request ID to every response -----------------------
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    """
+    Attaches a unique X-Request-ID to every response.
+    The frontend can log this ID so you can correlate a user-reported error
+    with a specific server log line.
+    """
+    request_id = str(uuid.uuid4())
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
+# ---- Global exception handler: no raw tracebacks in production -------------
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """
+    Catches any unhandled exception and returns a clean JSON error.
+    This prevents Python tracebacks from leaking into API responses,
+    which is both a security and UX concern.
+    """
+    request_id = getattr(request.state, "request_id", "unknown")
+    logger.exception("Unhandled exception [request_id=%s]: %s", request_id, exc)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "An internal server error occurred. Please try again.",
+            "request_id": request_id,
+        },
+    )
 
 
 # ---- Helpers ----------------------------------------------------------------
@@ -146,32 +181,48 @@ def run_prediction(hgb: float, mcv: float, mch: float, rbc: float) -> Dict[str, 
         diagnosis = "Normal"
 
     score_map = {
-        "Normal":                  1,
-        "Iron Deficiency Anemia":  2,
-        "Borderline":              3,
-        "Alpha Thalassemia Trait": 6,
-        "Beta Thalassemia Trait":  6,
-        "Thalassemia Trait":       6,
-        "Possible Thalassemia":    5,
-        "Beta Thalassemia":        8,
-        "Thalassemia Major":       10,
-        "Thalassemia Intermedia":  7,
+        # Normal / low risk
+        "Normal":                   1,
+        "Iron Deficiency Anemia":   2,
+        # Borderline
+        "Borderline":               3,
+        # Traits / possible (score 5-6)
+        "Alpha Thalassemia Trait":  6,
+        "Alpha-Thalassemia Minor":  6,
+        "Alpha Thalassemia Minor":  6,
+        "Beta Thalassemia Trait":   6,
+        "Beta-Thalassemia Minor":   6,
+        "Beta Thalassemia Minor":   6,
+        "Thalassemia Trait":        6,
+        "Possible Thalassemia":     5,
+        # Severe (score 7-10)
+        "Beta Thalassemia":         8,
+        "Beta-Thalassemia Major":   9,
+        "Beta Thalassemia Major":   9,
+        "Thalassemia Major":        10,
+        "Thalassemia Intermedia":   7,
     }
     thalassemia_score = score_map.get(diagnosis, 5)
 
     rec_map = {
-        "Normal":                  "No signs of thalassemia. Routine annual CBC recommended.",
-        "Iron Deficiency Anemia":  "Iron supplementation recommended. Recheck CBC in 3 months.",
-        "Borderline":              "Borderline results. Repeat CBC in 1 month.",
-        "Alpha Thalassemia Trait": "Alpha thalassemia trait detected. Genetic counselling advised.",
-        "Beta Thalassemia Trait":  "Beta thalassemia trait detected. Genetic counselling advised.",
-        "Thalassemia Trait":       "Thalassemia trait detected. Hemoglobin electrophoresis recommended.",
-        "Possible Thalassemia":    "Possible thalassemia - consult a hematologist.",
-        "Beta Thalassemia":        "Beta thalassemia - specialist evaluation required urgently.",
-        "Thalassemia Major":       "Thalassemia Major - urgent clinical evaluation required.",
-        "Thalassemia Intermedia":  "Thalassemia Intermedia - regular specialist follow-up required.",
+        "Normal":                   "No signs of thalassemia. Routine annual CBC recommended.",
+        "Iron Deficiency Anemia":   "Iron supplementation recommended. Recheck CBC in 3 months.",
+        "Borderline":               "Borderline results. Repeat CBC in 1 month.",
+        "Alpha Thalassemia Trait":  "Alpha thalassemia trait detected. Genetic counselling advised.",
+        "Alpha-Thalassemia Minor":  "Alpha thalassemia minor detected. Hemoglobin electrophoresis and genetic counselling recommended.",
+        "Alpha Thalassemia Minor":  "Alpha thalassemia minor detected. Hemoglobin electrophoresis and genetic counselling recommended.",
+        "Beta Thalassemia Trait":   "Beta thalassemia trait detected. Genetic counselling advised.",
+        "Beta-Thalassemia Minor":   "Beta thalassemia minor (trait) detected. Hemoglobin electrophoresis and genetic counselling recommended.",
+        "Beta Thalassemia Minor":   "Beta thalassemia minor (trait) detected. Hemoglobin electrophoresis and genetic counselling recommended.",
+        "Thalassemia Trait":        "Thalassemia trait detected. Hemoglobin electrophoresis recommended.",
+        "Possible Thalassemia":     "Possible thalassemia - consult a hematologist.",
+        "Beta Thalassemia":         "Beta thalassemia - specialist evaluation required urgently.",
+        "Beta-Thalassemia Major":   "Beta thalassemia major - urgent specialist evaluation and transfusion therapy planning required.",
+        "Beta Thalassemia Major":   "Beta thalassemia major - urgent specialist evaluation and transfusion therapy planning required.",
+        "Thalassemia Major":        "Thalassemia Major - urgent clinical evaluation required.",
+        "Thalassemia Intermedia":   "Thalassemia Intermedia - regular specialist follow-up required.",
     }
-    recommendation = rec_map.get(diagnosis, "Abnormal CBC. Please consult a hematologist.")
+    recommendation = rec_map.get(diagnosis, "Abnormal CBC indices detected. Please consult a hematologist for further evaluation.")
 
     explanation = (
         f"CBC values: HGB={hgb} g/dL, MCV={mcv} fL, MCH={mch} pg, RBC={rbc} x10^12/L. "
@@ -231,7 +282,16 @@ def run_ocr(image_bytes: bytes) -> Dict[str, Optional[float]]:
     arr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
-        raise ValueError("Could not decode image.")
+        raise ValueError("Could not decode image. Please upload a valid PNG or JPEG.")
+
+    # FIX: Guard against memory exhaustion from enormous images.
+    # A 20000x20000 image resized 2.5x = 50000x50000 = 2.5 GB RAM — instant OOM crash.
+    h, w = img.shape[:2]
+    if h > MAX_IMAGE_DIM or w > MAX_IMAGE_DIM:
+        raise ValueError(
+            f"Image dimensions {w}x{h} exceed the {MAX_IMAGE_DIM}px limit. "
+            "Please resize the image and try again."
+        )
 
     gray   = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     gray   = cv2.resize(gray, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
@@ -265,10 +325,10 @@ def run_ocr(image_bytes: bytes) -> Dict[str, Optional[float]]:
 # ---- Schemas ----------------------------------------------------------------
 
 class PatientData(BaseModel):
-    hgb: float = Field(..., gt=0, le=25,  description="Hemoglobin g/dL",            examples=[13.5])
-    mcv: float = Field(..., gt=0, le=130, description="Mean Corpuscular Volume fL",  examples=[72.0])
-    mch: float = Field(..., gt=0, le=50,  description="Mean Corpuscular Hemoglobin pg", examples=[24.0])
-    rbc: float = Field(..., gt=0, le=8,   description="Red Blood Cell count x10^12/L", examples=[5.1])
+    hgb: float = Field(..., gt=0, le=25,  description="Hemoglobin g/dL",                examples=[13.5])
+    mcv: float = Field(..., gt=0, le=130, description="Mean Corpuscular Volume fL",      examples=[72.0])
+    mch: float = Field(..., gt=0, le=50,  description="Mean Corpuscular Hemoglobin pg",  examples=[24.0])
+    rbc: float = Field(..., gt=0, le=8,   description="Red Blood Cell count x10^12/L",   examples=[5.1])
 
     @field_validator("rbc")
     @classmethod
@@ -298,12 +358,12 @@ class HealthResponse(BaseModel):
 
 @app.get("/health", response_model=HealthResponse, tags=["System"])
 def health_check():
-    """Health check - used by Docker, Railway, and monitoring tools."""
+    """Health check — used by Railway, Docker, and monitoring tools."""
     return HealthResponse(
-        status="ok",
+        status="ok" if (_model and _label_encoder) else "degraded",
         model_loaded=_model is not None,
         encoder_loaded=_label_encoder is not None,
-        version="3.0.0",
+        version="3.1.0",
     )
 
 
