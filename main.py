@@ -1,4 +1,3 @@
-
 import io
 import logging
 import os
@@ -43,6 +42,13 @@ MAX_IMAGE_DIM = 8000
 
 raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:8088")
 ALLOWED_ORIGINS: List[str] = [o.strip() for o in raw_origins.split(",") if o.strip()]
+
+# Always include "null" so that requests from file:// protocol are accepted
+# (browsers send Origin: null for local file requests).
+# If "*" is present, we use wildcard mode (no credentials).
+_USE_WILDCARD = "*" in ALLOWED_ORIGINS
+if not _USE_WILDCARD and "null" not in ALLOWED_ORIGINS:
+    ALLOWED_ORIGINS.append("null")
 
 VALID_RANGES: Dict[str, tuple] = {
     "HGB": (3.0, 25.0),
@@ -101,11 +107,13 @@ app = FastAPI(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# When using wildcard "*", credentials must be disabled (browser security rule).
+# When using explicit origins (including "null" for file://), credentials are fine.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["GET", "POST"],
+    allow_origins=["*"] if _USE_WILDCARD else ALLOWED_ORIGINS,
+    allow_credentials=not _USE_WILDCARD,
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
